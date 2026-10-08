@@ -18,6 +18,7 @@ Configuration (GitHub repository *variables* or secrets; all optional):
   RESEARCH_MODEL        litellm id of a web-search model (default: auto)
   EXTREMIZE             logit multiplier for binary aggregate (default 1.0 = off)
   DRY_RUN               "1" = don't publish to Metaculus
+  TOURNAMENT_ID         override the seasonal tournament (id or slug, e.g. fall-futureeval-2026)
 
 Run:  python ensemble_bot.py --mode tournament | test_questions | metaculus_cup
 """
@@ -126,13 +127,22 @@ def ensemble_model_ids() -> list[str]:
     raise RuntimeError("No LLM key configured")
 
 
-def make_llm(model_id: str) -> GeneralLlm:
-    kw = dict(model=model_id, temperature=None if "gpt-5" in model_id else 0.3, timeout=240, allowed_tries=2)
+NO_TEMPERATURE = ("anthropic/", "claude", "openai/gpt-5", "openai/o", "x-ai/grok")   # these reject/deprecate temperature
+
+
+def _strip_temperature(llm: GeneralLlm) -> GeneralLlm:
+    """Newer reasoning models (e.g. Claude 5.x, GPT-5.x) return 400 'temperature is deprecated'. The pinned
+    forecasting-tools (0.2.92) doesn't auto-drop it, so never send it for those models."""
+    if any(k in llm.model for k in NO_TEMPERATURE):
+        llm.litellm_kwargs.pop("temperature", None)
+    return llm
+
+
+def make_llm(model_id: str, temperature: float | None = 0.3, timeout: int = 240) -> GeneralLlm:
+    kw = dict(model=model_id, temperature=temperature, timeout=timeout, allowed_tries=2)
     if "openai/gpt-5" in model_id or "x-ai/grok" in model_id:
         kw["reasoning_effort"] = "high"                 # high-reasoning variants beat standard twins 8/8 (Spring 2026)
-    if kw["temperature"] is None:
-        kw.pop("temperature")
-    return GeneralLlm(**kw)
+    return _strip_temperature(GeneralLlm(**kw))
 
 
 def parser_model_id(ensemble_ids: list[str]) -> str:
@@ -214,8 +224,7 @@ class EnsembleBot(FallTemplateBot2026):
             if self.research_id:
                 try:
                     prompt = self._get_research_prompt(question, self.research_id)
-                    web = await GeneralLlm(model=self.research_id, temperature=0.1, timeout=180,
-                                           allowed_tries=2).invoke(prompt)
+                    web = await make_llm(self.research_id, temperature=0.1, timeout=180).invoke(prompt)
                     parts.append("## Web research\n" + web)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"web research failed: {e}")
@@ -266,7 +275,8 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        llms={"default": ids[0], "parser": parser_model_id(ids), "summarizer": parser_model_id(ids),
+        llms={"default": ids[0], "parser": make_llm(parser_model_id(ids), temperature=0.0, timeout=120),
+              "summarizer": make_llm(parser_model_id(ids), temperature=0.0, timeout=120),
               "researcher": research_model_id() or "no_research"},
         ensemble_ids=ids,
         research_id=research_model_id(),
@@ -278,7 +288,14 @@ if __name__ == "__main__":
             "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
             "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/"}
     if mode == "tournament":
-        reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+        # forecasting-tools 0.2.92 (pinned in the template's poetry.lock) still points at the closed SUMMER tournament
+        # (33022). The workflows upgrade to >=0.3.4 (Fall = 33121); TOURNAMENT_ID can override either way.
+        tid = os.getenv("TOURNAMENT_ID") or client.CURRENT_AI_COMPETITION_ID
+        if str(tid) == "33022":
+            logger.warning("library points at the closed Summer-2026 tournament; using fall-futureeval-2026")
+            tid = "fall-futureeval-2026"
+        logger.info(f"tournament: {tid}")
+        reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
         reports += asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
     elif mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
