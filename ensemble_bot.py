@@ -135,13 +135,14 @@ def make_llm(model_id: str) -> GeneralLlm:
     return GeneralLlm(**kw)
 
 
-def parser_model_id() -> str:
+def parser_model_id(ensemble_ids: list[str]) -> str:
+    """Cheap model that turns free-text forecasts into structured numbers."""
     if _env("OPENROUTER_API_KEY"):
         return "openrouter/openai/gpt-4o-mini"
     if _env("OPENAI_API_KEY"):
         return "gpt-4o-mini"
     if _env("ANTHROPIC_API_KEY"):
-        return "anthropic/claude-3-5-haiku-latest"
+        return ensemble_ids[0]            # Anthropic-only mode: reuse the picked (current) Claude model
     return "metaculus/gpt-4o-mini"
 
 
@@ -265,7 +266,7 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        llms={"default": ids[0], "parser": parser_model_id(), "summarizer": parser_model_id(),
+        llms={"default": ids[0], "parser": parser_model_id(ids), "summarizer": parser_model_id(ids),
               "researcher": research_model_id() or "no_research"},
         ensemble_ids=ids,
         research_id=research_model_id(),
