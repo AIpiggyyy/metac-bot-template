@@ -25,6 +25,8 @@ jobs:
           installer-parallel: true
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      - name: Upgrade forecasting-tools (lock pins 0.2.92 = old Summer tournament id, no temperature fix)
+        run: poetry run pip install --upgrade "forecasting-tools>=0.3.4,<0.4.0"
       - name: Run bot
         run: |
           poetry run python ensemble_bot.py --mode test_questions
@@ -42,3 +44,4 @@ jobs:
           RESEARCH_MODEL: ${{ vars.RESEARCH_MODEL }}
           EXTREMIZE: ${{ vars.EXTREMIZE }}
           DRY_RUN: ${{ vars.DRY_RUN }}
+          TOURNAMENT_ID: ${{ vars.TOURNAMENT_ID }}
