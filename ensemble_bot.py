@@ -19,11 +19,16 @@ Configuration (GitHub repository *variables* or secrets; all optional):
   EXTREMIZE             logit multiplier for binary aggregate (default 1.0 = off)
   DRY_RUN               "1" = don't publish to Metaculus
   TOURNAMENT_ID         override the seasonal tournament (id or slug, e.g. fall-futureeval-2026)
+  SPOT_TOURNAMENTS      comma list of spot-scored tournaments to also forecast in tournament mode
+                        (default: market-pulse-26q4; "none" to disable). Only the forecast standing at close
+                        counts there, so questions are forecast once when first seen and re-forecast in the last
+                        SPOT_WINDOW_H hours before close (at most once per SPOT_REFRESH_H hours).
 
 Run:  python ensemble_bot.py --mode tournament | test_questions | metaculus_cup
 """
 import argparse
 import asyncio
+import datetime as dt
 import itertools
 import logging
 import math
@@ -223,14 +228,14 @@ class EnsembleBot(FallTemplateBot2026):
                     logger.warning(f"AskNews failed: {e}")
             if self.research_id:
                 try:
-                    prompt = self._get_research_prompt(question, self.research_id)
+                    prompt = self._get_research_prompt(question, self.research_id) + finance_hint(question)
                     web = await make_llm(self.research_id, temperature=0.1, timeout=180).invoke(prompt)
                     parts.append("## Web research\n" + web)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"web research failed: {e}")
             if not parts:   # last resort: ask the first ensemble model what it knows
                 try:
-                    prompt = self._get_research_prompt(question, "llm")
+                    prompt = self._get_research_prompt(question, "llm") + finance_hint(question)
                     parts.append("## Background (model knowledge, no live search)\n"
                                  + await self._uniq[0].invoke(prompt))
                 except Exception as e:  # noqa: BLE001
@@ -246,6 +251,45 @@ class EnsembleBot(FallTemplateBot2026):
             z = math.log(p / (1 - p)) * self.extremize
             agg = min(max(1 / (1 + math.exp(-z)), 0.01), 0.99)
         return agg
+
+
+# ----------------------------------------------------------------------------- spot-scored tournaments
+
+FINANCE_HINT = (
+    "\n\nThis is a company-financials question. Check the exact resolution basis in the question "
+    "(e.g. GAAP diluted EPS vs adjusted/non-GAAP; total revenue; the company's own guidance figure). Report: "
+    "(1) the latest analyst consensus for the exact metric and whether it is GAAP or adjusted, with date and "
+    "source; (2) the company's own guidance for the period; (3) the last 8 quarters of the reported metric and "
+    "how far each beat or missed consensus; (4) known one-off GAAP items this quarter (stock comp, impairments, "
+    "investment gains/losses, tax items) that make GAAP differ from adjusted; (5) the confirmed report date.")
+FINANCE_WORDS = ("earnings per share", "revenue", "guidance", "gross margin", "operating expenses")
+
+
+def finance_hint(question: MetaculusQuestion) -> str:
+    t = (question.question_text or "").lower()
+    return FINANCE_HINT if any(w in t for w in FINANCE_WORDS) else ""
+
+
+def spot_due(q: MetaculusQuestion, now: dt.datetime) -> bool:
+    """Forecast if never forecast, or if inside the pre-close window and the last forecast is stale."""
+    if not q.already_forecasted:
+        return True
+    if q.close_time is None:
+        return False
+    close = q.close_time if q.close_time.tzinfo else q.close_time.replace(tzinfo=dt.timezone.utc)
+    hours_left = (close - now).total_seconds() / 3600
+    if hours_left > float(os.getenv("SPOT_WINDOW_H") or "30") or hours_left < 0.5:
+        return False
+    last = q.timestamp_of_my_last_forecast
+    if last is None:
+        return True
+    last = last if last.tzinfo else last.replace(tzinfo=dt.timezone.utc)
+    return (now - last).total_seconds() / 3600 >= float(os.getenv("SPOT_REFRESH_H") or "20")
+
+
+def spot_tournaments() -> list[str]:
+    v = (os.getenv("SPOT_TOURNAMENTS") or "market-pulse-26q4").strip()
+    return [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip()]
 
 
 # ----------------------------------------------------------------------------- entry point
@@ -297,6 +341,19 @@ if __name__ == "__main__":
         logger.info(f"tournament: {tid}")
         reports = asyncio.run(bot.forecast_on_tournament(tid, return_exceptions=True))
         reports += asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        for spot_tid in spot_tournaments():
+            try:
+                qs = client.get_all_open_questions_from_tournament(spot_tid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"spot tournament {spot_tid}: could not list questions ({e})")
+                continue
+            now = dt.datetime.now(dt.timezone.utc)
+            due = [q for q in qs if spot_due(q, now)]
+            logger.info(f"spot tournament {spot_tid}: {len(qs)} open, {len(due)} due now")
+            if due:
+                bot.skip_previously_forecasted_questions = False
+                reports += asyncio.run(bot.forecast_questions(due, return_exceptions=True))
+                bot.skip_previously_forecasted_questions = True
     elif mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
         reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
